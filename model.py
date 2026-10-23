@@ -24,8 +24,10 @@ Components:
                        generation.py's module docstring), so fc.state_dict() becomes
                        directly loadable into Reg2RG's self.fc too, not just
                        perceiver's into self.perceiver.
-    bert_text       - fvlm's text_encoder (frozen), warm-started from fvlm's
-                       checkpoint_040.pth.
+    bert_text       - fvlm's text_encoder (frozen), warm-started from fvlm's own
+                       originally-released checkpoint (model.pth, not the further-
+                       finetuned checkpoint_040.pth - see FVLM_CHECKPOINT's own
+                       comment for why, verified identical where it matters).
     adapter         - Linear(768, 4096), trainable, random init. Projects frozen
                        BERT's 768-d [CLS] output into fc's same 4096-d space, so the
                        contrastive branch compares two *projected* 4096-d vectors
@@ -63,7 +65,15 @@ from vendored import PerceiverResampler, ViT as RadFMViT, apply_environment_patc
 
 RADFM_VIT3D_PATH = "/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/weights/Reg2RG_weights/RadFM_vit3d.pth"
 RADFM_PERCEIVER_FC_PATH = "/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/weights/Reg2RG_weights/RadFM_perceiver_fc.pth"
-FVLM_CHECKPOINT = "/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/weights/fvlm_weights/finetuned/checkpoint_040.pth"
+#  fvlm's own originally-released checkpoint (4-organ, pretrained), not the
+# further-finetuned 10-organ checkpoint_040.pth - text_encoder is byte-identical
+# between the two (fvlm's own organ-expansion finetuning only ever touches new
+# organs' query_tokens/vision_proj, never text_encoder/text_proj - see fvlm/
+# KE_prepare_unique/2_compute_text_embeddings.py's own comment on this), so this
+# carries zero quality cost while also being fvlm's publicly-released checkpoint
+# (https://drive.google.com/drive/folders/15BnMo1lIAlOH_8KLdB2NugiHnmj9AWSD), not
+# a private file.
+FVLM_CHECKPOINT = "/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/weights/fvlm_weights/model.pth"
 
 VIS_DIM = 768
 PERCEIVER_NUM_LATENTS = 32  # must match Reg2RG's self.perceiver exactly

@@ -56,7 +56,7 @@
 |---|---|
 | `RadFM_vit3d.pth` | vision_encoder（冻住）|
 | `RadFM_perceiver_fc.pth` | 只用来给perceiver热启动（文件里虽然也有`fc`这个key，但我们故意不加载它——fc是随机初始化、自己从头训练的，跟Reg2RG自己的precedent一致，见`model.py`里`build_fc()`的说明）|
-| `checkpoint_040.pth`（fvlm微调过的） | 冻住的BERT文字编码器权重，也可以用fvlm论文官方发布的原始预训练权重替代（text_encoder部分完全一样，不受fvlm自己后续器官扩展微调的影响）：https://drive.google.com/drive/folders/15BnMo1lIAlOH_8KLdB2NugiHnmj9AWSD |
+| `model.pth` | 冻住的BERT文字编码器权重，fvlm官方公开发布（https://drive.google.com/drive/folders/15BnMo1lIAlOH_8KLdB2NugiHnmj9AWSD ）|
 | `llama_weights/`（LLaMA-2-7B-chat-hf） | 生成分支的冻住decoder |
 
 **环境**：conda环境`reg2rg`（本项目一直在这个环境里跑），关键依赖包括`torch`、`transformers`、`monai`、`lavis`（走fvlm那份，不是pip装的）、`wandb`（可选）。
