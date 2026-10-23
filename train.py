@@ -1,16 +1,22 @@
-"""Training loop for the Perceiver/BERT alignment pretraining: contrastive loss
-(Perceiver pooled output vs frozen BERT) + generation loss (Perceiver tokens -> fc ->
-frozen LLaMA-13B decoder -> next-token cross-entropy against the organ's report),
-combined as a weighted sum. --no_generation drops the LLaMA-13B branch entirely for a
-lighter contrastive-only run.
+"""Training loop for the Perceiver/BERT/adapter alignment pretraining: contrastive
+loss (fc-projected image tokens vs adapter-projected BERT text embedding, both in
+fc's 4096-d space, matching Reg2RG's actual LLaMA-2-7B-chat hidden size) + generation
+loss (fc-projected, un-pooled image embedding -> frozen LLaMA-2-7B-chat decoder ->
+next-token cross-entropy against the organ's report), combined as a weighted sum.
+fc is shared between both branches (built once, inside PerceiverAlignmentModel - see
+model.py's module docstring); adapter only exists for the contrastive branch.
+--no_generation drops the LLaMA-2-7B-chat branch entirely for a lighter
+contrastive-only run - fc and adapter still train in that mode too, since fc is
+exercised by encode_image unconditionally.
 
 Multi-GPU: data parallelism via torch.distributed/DistributedDataParallel, launched
 with torchrun (matches Reg2RG's own launch convention - see scripts/train_radgenome.sh
 in the Reg2RG archive). Each GPU holds its own full copy of every module (including
-the frozen 13B decoder) and processes a different data shard; only perceiver, fc, and
-temp need gradient sync across GPUs, since everything else is frozen. Launched without
-torchrun (no RANK env var), this falls back to ordinary single-GPU/CPU execution
-unchanged - that's what the smoke test and all single-GPU runs so far have used.
+the frozen 7B decoder) and processes a different data shard; only perceiver, fc,
+adapter, and temp need gradient sync across GPUs, since everything else is frozen.
+Launched without torchrun (no RANK env var), this falls back to ordinary
+single-GPU/CPU execution unchanged - that's what the smoke test and all single-GPU
+runs so far have used.
 
 Batch composition note: InfoNCE's negatives are "every other item in the batch", so a
 batch dominated by one organ (e.g. many 'lung' items, since lung has by far the most
@@ -28,7 +34,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from dataset import PerOrganDataset, collate_skip_none
-from generation import build_fc, build_lang_model, build_tokenizer, generation_loss
+from generation import build_lang_model, build_tokenizer, generation_loss
 from grad_balance import balanced_backward
 from losses import info_nce_loss
 from model import PerceiverAlignmentModel
@@ -54,9 +60,9 @@ def main():
     parser.add_argument("--contrastive_weight", type=float, default=0.2)
     parser.add_argument("--generation_weight", type=float, default=0.8)
     parser.add_argument("--no_generation", action="store_true",
-                         help="contrastive loss only, skip the LLaMA-13B decoder "
-                              "branch entirely (useful while its checkpoint isn't "
-                              "ready yet, or for an ablation)")
+                         help="contrastive loss only, skip the LLaMA-2-7B-chat "
+                              "decoder branch entirely (useful while its checkpoint "
+                              "isn't ready yet, or for an ablation)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--save_every_steps", type=int, default=1000)
@@ -124,14 +130,13 @@ def main():
         )
 
     if is_main:
-        print("Building model...")
+        print("Building model (perceiver + fc + bert + adapter)...")
     model = PerceiverAlignmentModel(device, init_temperature=args.temperature)
 
-    fc = lang_model = tokenizer = None
+    lang_model = tokenizer = None
     if not args.no_generation:
         if is_main:
-            print("Building generation branch (fc + frozen LLaMA-13B decoder)...")
-        fc = build_fc().to(device)
+            print("Building generation branch (frozen LLaMA-2-7B-chat decoder)...")
         lang_model = build_lang_model(device)
         tokenizer = build_tokenizer()
 
@@ -140,23 +145,23 @@ def main():
     # .grad *after* both complete, which doesn't fit DDP's hook-based "average
     # whatever backward() touches, as it happens" model. Every rank instead runs a
     # fully local forward/backward on its own data shard, and every trainable
-    # parameter's gradient (perceiver, fc, temp) is explicitly all_reduce-averaged by
-    # hand after combining - same approach already used for temp alone before this
-    # change, just extended to cover perceiver/fc too.
+    # parameter's gradient (perceiver, fc, adapter, temp) is explicitly
+    # all_reduce-averaged by hand after combining - same approach already used for
+    # temp alone before this change, just extended to cover the rest too.
     perceiver_module = model.perceiver
-    fc_module = fc
+    fc_module = model.fc
+    adapter_module = model.adapter
 
-    trainable_params = list(perceiver_module.parameters()) + [model.temp]
-    if fc_module is not None:
-        trainable_params += list(fc_module.parameters())
+    trainable_params = (
+        list(perceiver_module.parameters()) + list(fc_module.parameters())
+        + list(adapter_module.parameters()) + [model.temp]
+    )
 
     if is_main:
         n_trainable = sum(p.numel() for p in trainable_params)
         n_total = sum(p.numel() for p in model.parameters())
         if lang_model is not None:
             n_total += sum(p.numel() for p in lang_model.parameters())
-        if fc_module is not None:
-            n_total += sum(p.numel() for p in fc_module.parameters())
         print(f"Trainable params: {n_trainable:,} / {n_total:,} total "
               f"({100 * n_trainable / n_total:.3f}%)")
         if distributed:
@@ -171,8 +176,8 @@ def main():
         if distributed:
             sampler.set_epoch(epoch)  # reshuffles differently each epoch
         model.perceiver.train()
-        if fc is not None:
-            fc.train()
+        model.fc.train()
+        model.adapter.train()
         for batch in loader:
             if batch is None:
                 continue
@@ -180,18 +185,21 @@ def main():
             volume = batch["image"].to(device)
             texts = batch["text"]
 
-            image_tokens, image_pooled = model.encode_image(volume)
+            image_embeds = model.encode_image(volume)
             text_embeds = model.encode_text(texts)
 
-            contrastive = info_nce_loss(image_pooled, text_embeds, model.temp)
+            contrastive = info_nce_loss(image_embeds, text_embeds, model.temp)
 
             optimizer.zero_grad()
 
             if args.no_generation:
-                # Nothing to balance - contrastive is the only loss touching
-                # perceiver, so a plain backward is correct as-is.
-                contrastive.backward()
-                loss_value = contrastive.item()
+                # Contrastive is the only loss, but it now touches both the "shared"
+                # params (perceiver+fc, via encode_image) and adapter (via
+                # encode_text) - no competing gradient to balance against, so a plain
+                # backward is still correct, just scaled by contrastive_weight for
+                # consistency with the --no_generation=False logging/semantics.
+                (args.contrastive_weight * contrastive).backward()
+                loss_value = args.contrastive_weight * contrastive.item()
                 gen_loss_value = None
                 c_grad_norm = g_grad_norm = None
                 if distributed:
@@ -200,17 +208,20 @@ def main():
                             dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
             else:
                 generation = generation_loss(
-                    image_tokens, texts, fc, lang_model, tokenizer, device,
+                    image_embeds, texts, lang_model, tokenizer, device,
                 )
                 # Computes both backward passes internally (contrastive first, with
                 # retain_graph=True, then generation), normalizes each loss's
-                # gradient on the shared perceiver params before combining with the
-                # stated weights, and (if distributed) all_reduces the final combined
-                # gradient for perceiver/fc - see grad_balance.py's module docstring
-                # for why this replaces a plain weighted-sum .backward() call.
+                # gradient on the shared perceiver+fc params before combining with
+                # the stated weights, takes adapter's gradient directly from
+                # contrastive (nothing competes with it there), and (if distributed)
+                # all_reduces the final combined gradient - see grad_balance.py's
+                # module docstring for why this replaces a plain weighted-sum
+                # .backward() call.
                 c_grad_norm, g_grad_norm = balanced_backward(
-                    contrastive, generation, perceiver_module.parameters(),
-                    fc_module.parameters(), args.contrastive_weight,
+                    contrastive, generation,
+                    list(perceiver_module.parameters()) + list(fc_module.parameters()),
+                    adapter_module.parameters(), args.contrastive_weight,
                     args.generation_weight, distributed,
                 )
                 if distributed and model.temp.grad is not None:
@@ -243,9 +254,13 @@ def main():
                     wandb.log(log_dict, step=global_step)
 
             if is_main and (not args.smoke_test) and global_step > 0 and global_step % args.save_every_steps == 0:
-                ckpt_path = os.path.join(args.output_dir, f"perceiver-step{global_step}.pth")
-                torch.save(perceiver_module.state_dict(), ckpt_path)
-                print(f"Saved {ckpt_path}")
+                perceiver_ckpt_path = os.path.join(args.output_dir, f"perceiver-step{global_step}.pth")
+                fc_ckpt_path = os.path.join(args.output_dir, f"fc-step{global_step}.pth")
+                adapter_ckpt_path = os.path.join(args.output_dir, f"adapter-step{global_step}.pth")
+                torch.save(perceiver_module.state_dict(), perceiver_ckpt_path)
+                torch.save(fc_module.state_dict(), fc_ckpt_path)
+                torch.save(adapter_module.state_dict(), adapter_ckpt_path)
+                print(f"Saved {perceiver_ckpt_path}, {fc_ckpt_path}, and {adapter_ckpt_path}")
 
             global_step += 1
 
@@ -256,9 +271,13 @@ def main():
                 return
 
     if is_main:
-        final_path = os.path.join(args.output_dir, "perceiver-final.pth")
-        torch.save(perceiver_module.state_dict(), final_path)
-        print(f"Saved {final_path}")
+        final_perceiver_path = os.path.join(args.output_dir, "perceiver-final.pth")
+        final_fc_path = os.path.join(args.output_dir, "fc-final.pth")
+        final_adapter_path = os.path.join(args.output_dir, "adapter-final.pth")
+        torch.save(perceiver_module.state_dict(), final_perceiver_path)
+        torch.save(fc_module.state_dict(), final_fc_path)
+        torch.save(adapter_module.state_dict(), final_adapter_path)
+        print(f"Saved {final_perceiver_path}, {final_fc_path}, and {final_adapter_path}")
         if use_wandb:
             wandb.finish()
 

@@ -16,10 +16,14 @@ specifically - see /home/wisc/dxiang23/.claude/projects/.../memory/
 project_reg2rg_base_pivot.md - since that archive is where the trained Perceiver is
 going back into, not the fvlm-modified working copy.
 """
+import glob
+import hashlib
 import os
+import pickle
 import sys
 
 import torch
+import tqdm.auto as tqdm
 from torch.utils.data import Dataset
 
 _ARCHIVE_SRC = os.path.join(
@@ -29,6 +33,61 @@ _ARCHIVE_SRC = os.path.join(
 )
 sys.path.insert(0, _ARCHIVE_SRC)
 from Dataset.radgenome_dataset_train import RadGenomeDataset_Train, REGIONS  # noqa: E402
+
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_cache")
+
+
+def _prepare_samples(data_folder, mask_folder, accession_to_sentences):
+    """Re-implements RadGenomeDataset_Train.prepare_samples()'s logic exactly (same
+    glob scan, same per-organ (mask_file, report) dict shape), but keyed by
+    data_folder so a validation-split call can never silently load a cached
+    train-split result. The archive's own prepare_samples() caches to a single
+    hardcoded path (src/Dataset/train_samples.pkl) regardless of which data_folder/
+    csv_file were passed to the constructor - confirmed directly: building this
+    dataset against valid_preprocessed/validation_region_report.csv still printed
+    "24126 patients -> 180719 items", the exact train-split counts, because that
+    cache file already existed from earlier train-split runs and the archive's
+    method doesn't vary its cache key by split at all. Not our place to patch the
+    archive's own method (it's the target codebase, not ours to edit) - this
+    sidesteps it entirely by doing the same scan independently, cached under our own
+    directory with a split-aware filename.
+    """
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    cache_key = hashlib.sha1(data_folder.encode()).hexdigest()[:12]
+    cache_file = os.path.join(_CACHE_DIR, f"samples_{cache_key}.pkl")
+
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+
+    samples = []
+    patient_folders = glob.glob(os.path.join(data_folder, "*"))
+    for patient_folder in tqdm.tqdm(patient_folders, desc=f"indexing {data_folder}"):
+        accession_folders = glob.glob(os.path.join(patient_folder, "*"))
+        for accession_folder in accession_folders:
+            nii_files = glob.glob(os.path.join(accession_folder, "*.nii.gz"))
+            for nii_file in nii_files:
+                accession_number = nii_file.split("/")[-1]
+                if accession_number not in accession_to_sentences:
+                    continue
+                single_sample = {}
+                volume_name = accession_number.split(".")[0]
+                mask_path = os.path.join(mask_folder, "seg_" + volume_name)
+                single_sample["image"] = nii_file
+                flag = False
+                for region in REGIONS:
+                    if region in accession_to_sentences[accession_number]:
+                        mask_file = os.path.join(mask_path, region + ".nii.gz")
+                        region_report = accession_to_sentences[accession_number][region]
+                        single_sample[region] = [mask_file, region_report]
+                        flag = True
+                if not flag:
+                    continue
+                samples.append(single_sample)
+
+    with open(cache_file, "wb") as f:
+        pickle.dump(samples, f)
+    return samples
 
 
 class PerOrganDataset(Dataset):
@@ -49,6 +108,14 @@ class PerOrganDataset(Dataset):
             data_folder=data_folder,
             mask_folder=mask_folder,
             csv_file=csv_file,
+        )
+        # Overwrite the base instance's samples (which __init__ already computed via
+        # its own broken-caching prepare_samples()) with our split-aware version - see
+        # _prepare_samples()'s docstring. accession_to_sentences itself is fine as-is
+        # (load_accession_sentences(csv_file) has no caching, so it's already correct
+        # per-split); only the cached glob-scan result needed replacing.
+        self._base.samples = _prepare_samples(
+            data_folder, mask_folder, self._base.accession_to_sentences
         )
 
         self.flat_index = []  # list of (sample_idx, organ_name)

@@ -1,4 +1,6 @@
-# 正式训练配置：3张卡数据并行，先跑着观察loss曲线再决定要不要提前停
+# 正式训练配置（架构改版后重启）：perceiver+fc共用(768->4096,配真正的LLaMA-2-7B-chat)，
+# 文字侧adapter(768->4096)，对比学习用32次cosine取平均，不再是mean pool。
+# 3张卡数据并行，先跑着观察loss曲线再决定要不要提前停。
 
 cuda_devices="0,1,2"
 master_port="29500"
@@ -8,7 +10,7 @@ data_folder="$data_root/train_preprocessed"
 mask_folder="$data_root/train_region_mask"
 csv_file="$data_root/radgenome_files/train_region_report.csv"
 
-output_dir="/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/outputs/radfm_perceiver_align/run_20261020"
+output_dir="/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/outputs/radfm_perceiver_align/run_20261021"
 
 batch_size=4
 num_workers=4

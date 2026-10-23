@@ -3,3 +3,5 @@ __pycache__/
 scripts/wandb/
 *.pth
 *.log
+sample_cache/
+.DS_Store

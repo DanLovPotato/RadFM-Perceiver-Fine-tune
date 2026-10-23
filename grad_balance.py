@@ -1,21 +1,25 @@
 """Gradient-norm balancing between the contrastive and generation losses, where they
-share the Perceiver's parameters.
+share the Perceiver's and fc's parameters (model.py's encode_image applies fc for
+both branches - see its module docstring).
 
 Why this exists: a plain weighted sum (contrastive_weight*contrastive_loss +
 generation_weight*generation_loss).backward() lets whichever loss happens to produce
-the larger gradient dominate Perceiver's updates, regardless of the loss weights -
-measured directly (diag_gradient_scale.py) at 28x raw gradient-norm ratio
+the larger gradient dominate the shared params' updates, regardless of the loss
+weights - measured directly (diag_gradient_scale.py) at 28x raw gradient-norm ratio
 (generation's gradient on Perceiver vs contrastive's), 112x after applying the
 0.2/0.8 weights. Training confirmed this: contrastive loss sat flat at ~ln(4) (the
 untrained baseline) for 300+ steps while generation loss kept dropping - the
 contrastive signal was being drowned out, not slow to start.
 
-Fix: compute each loss's gradient on the *shared* Perceiver parameters separately,
-normalize each to unit norm, then recombine with the stated weights - so the weights
-actually control each loss's relative influence on Perceiver, independent of the
-losses' raw numeric scale. fc and temp each only receive gradient from one loss
-(generation and contrastive respectively), so they need no normalization - they just
-take whichever backward pass actually touches them.
+Fix: compute each loss's gradient on the *shared* parameters separately, normalize
+each to unit norm, then recombine with the stated weights - so the weights actually
+control each loss's relative influence on the shared params, independent of the
+losses' raw numeric scale.
+
+perceiver and fc are shared. adapter (contrastive-only, feeds info_nce_loss via
+encode_text) only ever appears in the contrastive loss's graph, so it just takes that
+loss's raw gradient directly, scaled by contrastive_weight - no normalization needed
+since nothing competes with it on those params.
 
 DDP note: this needs two backward passes per step (one per loss, sharing one forward
 pass via retain_graph=True) instead of DDP's usual single backward-call-per-iteration
@@ -36,60 +40,67 @@ def _flat_norm(grads):
 
 
 def balanced_backward(
-    contrastive_loss, generation_loss, perceiver_params, fc_params,
+    contrastive_loss, generation_loss, shared_params, contrastive_only_params,
     contrastive_weight, generation_weight, distributed, eps=1e-8,
 ):
     """Replaces `(w1*contrastive_loss + w2*generation_loss).backward()`.
 
-    perceiver_params: params shared by both losses - gradient-normalized before
-        combining.
-    fc_params: params touched only by generation_loss - just takes that gradient
-        directly, scaled by generation_weight (no normalization needed - there's
-        nothing competing with it).
+    shared_params: perceiver + fc - touched by both losses, gradient-normalized on
+        each loss separately before combining.
+    contrastive_only_params: adapter - touched only by contrastive_loss (via
+        encode_text), so it just takes that gradient directly, scaled by
+        contrastive_weight (no normalization needed - there's nothing competing
+        with it).
     Leaves .grad populated on every param in both lists (and on temp, if it's part of
     the contrastive graph - the caller is responsible for temp exactly as before,
-    this function only touches perceiver_params/fc_params).
+    this function only touches shared_params/contrastive_only_params).
 
     Returns (contrastive_grad_norm, generation_grad_norm) - the raw (pre-normalization)
-    norms on perceiver_params, logged so the 28x-style imbalance can be watched over
+    norms on shared_params, logged so the 28x-style imbalance can be watched over
     training rather than just assumed fixed once and forgotten.
     """
-    perceiver_params = list(perceiver_params)
-    fc_params = list(fc_params)
-    all_params = perceiver_params + fc_params
+    shared_params = list(shared_params)
+    contrastive_only_params = list(contrastive_only_params)
+    all_params = shared_params + contrastive_only_params
 
     for p in all_params:
         p.grad = None
 
     # Pass 1: contrastive. retain_graph=True keeps the shared encode_image() forward
     # alive for pass 2 - both losses were computed from the same volume forward pass.
+    # Touches shared_params (via encode_image: perceiver -> fc) and
+    # contrastive_only_params (via encode_text: bert -> adapter) - never
+    # generation_loss's graph.
     contrastive_loss.backward(retain_graph=True)
-    contrastive_grads = [
+    contrastive_grads_shared = [
         p.grad.detach().clone() if p.grad is not None else None
-        for p in perceiver_params
+        for p in shared_params
     ]
-    contrastive_grad_norm = _flat_norm(contrastive_grads)
+    contrastive_grad_norm = _flat_norm(contrastive_grads_shared)
+    contrastive_grads_only = [
+        p.grad.detach().clone() if p.grad is not None else None
+        for p in contrastive_only_params
+    ]
 
     for p in all_params:
         p.grad = None
 
-    # Pass 2: generation. Touches both perceiver_params (via encode_image's shared
-    # graph) and fc_params (generation_loss's own parameters).
+    # Pass 2: generation. Touches both shared_params (via encode_image's shared
+    # graph) and fc_params (generation_loss's own parameters) - never reaches
+    # adapter, since encode_text isn't in this graph.
     generation_loss.backward()
-    generation_grads_perceiver = [
+    generation_grads_shared = [
         p.grad.detach().clone() if p.grad is not None else None
-        for p in perceiver_params
+        for p in shared_params
     ]
-    generation_grad_norm = _flat_norm(generation_grads_perceiver)
-    # fc's gradient from this pass is already sitting in p.grad for each fc param -
-    # leave it there untouched, just apply generation_weight to it below.
+    generation_grad_norm = _flat_norm(generation_grads_shared)
 
-    # Recombine perceiver's gradient: each loss's contribution normalized to unit
+    # Recombine shared_params' gradient: each loss's contribution normalized to unit
     # norm first, so contrastive_weight/generation_weight directly control relative
     # influence regardless of the two losses' raw gradient scale.
     c_scale = contrastive_weight / (contrastive_grad_norm + eps)
     g_scale = generation_weight / (generation_grad_norm + eps)
-    for p, cg, gg in zip(perceiver_params, contrastive_grads, generation_grads_perceiver):
+    for p, cg, gg in zip(shared_params, contrastive_grads_shared, generation_grads_shared):
         combined = torch.zeros_like(p.data)
         if cg is not None:
             combined = combined + c_scale * cg
@@ -97,9 +108,8 @@ def balanced_backward(
             combined = combined + g_scale * gg
         p.grad = combined
 
-    for p in fc_params:
-        if p.grad is not None:
-            p.grad = generation_weight * p.grad
+    for p, cg in zip(contrastive_only_params, contrastive_grads_only):
+        p.grad = contrastive_weight * cg if cg is not None else None
 
     if distributed:
         for p in all_params:
