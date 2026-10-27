@@ -85,16 +85,17 @@ bash train.sh run_20261021   # 对应 configs/train/run_20261021.sh，3张卡、
 
 每`save_every_steps`步，`perceiver-stepX.pth`、`fc-stepX.pth`、`adapter-stepX.pth`三个一起存到`output_dir`；训练结束再存一次`*-final.pth`。真正要搬进Reg2RG的只有`perceiver`和`fc`这两个，`adapter`只是训练阶段用，不进Reg2RG。
 
-### 4. 训完之后：重新生成knowledge bank的text embedding（可选）
+### 4. 训完之后：生成knowledge bank（4096维）
 
-如果要让Reg2RG的knowledge bank也用这次训出来的`adapter`重新算（4096维，不再是fvlm原来那个256维的），用：
+全部代码在`KE_generation/`里，流程图和说明见[KE_generation/README.md](KE_generation/README.md)。改好脚本开头的`cuda_device`/`ckpt_name`后：
 
 ```bash
-python3 compute_text_embeddings_4096.py \
-    --adapter_checkpoint /path/to/adapter-stepX.pth \
-    --output_path /path/to/organ_report_embeddings_4096.npz
+cd KE_generation
+bash run_train.sh   # train 的 bank + organ_annotation.json
+bash run_test.sh    # validation 的 organ_annotation.json（bank 跟 train 共用）
 ```
 
 ## 已知限制
 
-- `eval_retrieval.py`、`diag_gradient_scale.py`这两个脚本是早期架构（mean pool + 共享维度不是4096）时写的，还没跟着后面的改动同步更新，现在跑不了，仅供参考代码逻辑。
+- `diag_gradient_scale.py`是早期架构（mean pool + 共享维度不是4096）时写的一次性诊断脚本，已经完成它的历史使命（定位梯度不平衡问题），没有跟着后面的改动同步更新，现在跑不了，仅供参考代码逻辑。
+- `eval_retrieval.py`、`eval_generation.py`已经按当前架构（perceiver+fc共用4096维、32次cosine平均、真正的LLaMA-2-7B-chat）更新过，可以正常跑，用于在embed进Reg2RG之前快速比较候选checkpoint。

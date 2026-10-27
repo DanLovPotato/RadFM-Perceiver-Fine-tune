@@ -1,27 +1,24 @@
-"""Held-out retrieval evaluation for comparing candidate Perceiver checkpoints -
-standard CLIP-style image<->text retrieval accuracy (top-1/top-5), computed on
-validation data never seen during this pretraining (train.py only ever reads
-train_preprocessed/train_region_mask/train_region_report.csv).
+"""Held-out retrieval evaluation for comparing candidate (perceiver, fc, adapter)
+checkpoint triples - standard CLIP-style image<->text retrieval accuracy (top-1/
+top-5), computed on validation data never seen during this pretraining (train.py only
+ever reads train_preprocessed/train_region_mask/train_region_report.csv).
 
-Deliberately contrastive-only: fc isn't checkpointed alongside perceiver (train.py
-only saves perceiver.state_dict() at each save_every_steps), so a candidate
-perceiver's generation quality can't be fairly tested yet (whatever fc we'd pair it
-with wasn't trained jointly with that specific point in perceiver's trajectory).
-Retrieval accuracy only needs the (always-consistent, frozen) BERT text encoder, so it
-sidesteps that problem entirely and still measures exactly what this pretraining was
-for: image/text alignment quality.
+fc is shared between the contrastive and generation branches and adapter only exists
+for the contrastive branch (see model.py's module docstring) - evaluating a candidate
+step means loading all three together (perceiver-stepX.pth, fc-stepX.pth,
+adapter-stepX.pth), since they were trained jointly at that step.
+
+Similarity matches losses.info_nce_loss exactly: each of the 32 image tokens (after
+perceiver+fc) gets its own cosine similarity against the pooled text embedding, then
+those 32 scores are averaged - not a mean-pooled single image vector compared once.
 
 Single-pass design: the CT volume loading/preprocessing (CPU-bound, slow) and the
 frozen vision_encoder (3D ViT) + BERT text_encoder forward passes are IDENTICAL across
-every candidate checkpoint - only perceiver differs. A naive per-checkpoint loop (the
-original version of this script) re-does all of that expensive shared work once per
-checkpoint for no reason. This version instead loads one perceiver module per
-checkpoint up front, then does exactly one pass over the data: per batch, run
-vision_encoder/BERT once, then cheaply apply each checkpoint's perceiver to that same
-cached patch_tokens. ~4x fewer CT loads/ViT forwards for 4 checkpoints, with no
-accuracy difference (the math is identical, just reordered).
+every candidate checkpoint - only perceiver/fc/adapter differ. This does exactly one
+pass over the data: per batch, run vision_encoder/BERT once, then cheaply apply each
+checkpoint's perceiver+fc+adapter to that same cached patch_tokens/BERT output.
 
-Usage: python3 eval_retrieval.py --checkpoints step10000 step20000 step30000 step40000
+Usage: python3 eval_retrieval.py --checkpoints step10000 step30000 step50000 step69000
 """
 import argparse
 import os
@@ -31,33 +28,37 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import PerOrganDataset, collate_skip_none
-from model import PerceiverAlignmentModel, PerceiverResampler, PERCEIVER_NUM_LATENTS, VIS_DIM
+from model import PerceiverAlignmentModel, PerceiverResampler, PERCEIVER_NUM_LATENTS, VIS_DIM, LLM_HIDDEN_DIM
+import torch.nn as nn
 
 DATA_ROOT = "/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/data/dataset"
-CKPT_DIR = "/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/outputs/radfm_perceiver_align/run_20261020"
+CKPT_DIR = "/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/outputs/radfm_perceiver_align/run_20261021"
 
 
-def _apply_perceiver(perceiver_module, patch_tokens):
-    """Mirrors PerceiverAlignmentModel.encode_image's reshape/pool logic exactly,
-    but takes already-computed patch_tokens so the (frozen, shared-across-checkpoints)
+def _load_triple(ckpt_name, device):
+    perceiver = PerceiverResampler(dim=VIS_DIM, num_latents=PERCEIVER_NUM_LATENTS)
+    perceiver.load_state_dict(torch.load(os.path.join(CKPT_DIR, f"perceiver-{ckpt_name}.pth"), map_location=device))
+    fc = nn.Linear(VIS_DIM, LLM_HIDDEN_DIM)
+    fc.load_state_dict(torch.load(os.path.join(CKPT_DIR, f"fc-{ckpt_name}.pth"), map_location=device))
+    adapter = nn.Linear(VIS_DIM, LLM_HIDDEN_DIM)
+    adapter.load_state_dict(torch.load(os.path.join(CKPT_DIR, f"adapter-{ckpt_name}.pth"), map_location=device))
+    return (perceiver.to(device).eval(), fc.to(device).eval(), adapter.to(device).eval())
+
+
+def _apply_image_side(perceiver_module, fc_module, patch_tokens):
+    """Mirrors PerceiverAlignmentModel.encode_image exactly, but takes
+    already-computed patch_tokens so the (frozen, shared-across-checkpoints)
     vision_encoder forward isn't repeated per checkpoint."""
     pt = patch_tokens.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, N, 768)
     tokens = perceiver_module(pt)  # (B, 1, 32, 768)
     tokens = tokens[:, 0]  # (B, 32, 768)
-    return tokens.mean(dim=1)  # (B, 768)
-
-
-def _load_perceiver(ckpt_path, device):
-    perceiver = PerceiverResampler(dim=VIS_DIM, num_latents=PERCEIVER_NUM_LATENTS)
-    perceiver.load_state_dict(torch.load(ckpt_path, map_location=device))
-    return perceiver.to(device).eval()
+    return fc_module(tokens)  # (B, 32, 4096)
 
 
 @torch.no_grad()
-def compute_embeddings(model, perceivers, loader, device, max_items):
-    """One pass over loader. Returns (text_embeds, {ckpt_name: image_embeds})."""
-    text_embeds = []
-    image_embeds = {name: [] for name in perceivers}
+def compute_embeddings(model, triples, loader, device, max_items):
+    """One pass over loader. Returns {ckpt_name: (image_embeds (N,32,4096), text_embeds (N,4096))}."""
+    per_ckpt = {name: {"image": [], "text": []} for name in triples}
     n = 0
     for batch in loader:
         if batch is None:
@@ -66,26 +67,37 @@ def compute_embeddings(model, perceivers, loader, device, max_items):
         texts = batch["text"]
 
         patch_tokens, _ = model.vision_encoder(volume)  # frozen, shared
-        t_embeds = model.encode_text(texts)  # frozen, shared
-        text_embeds.append(F.normalize(t_embeds, dim=-1).cpu())
+        tokens = model.bert_tokenizer(
+            texts, padding="max_length", truncation=True, max_length=384, return_tensors="pt",
+        ).to(device)
+        bert_out = model.bert_text_encoder.forward_text(tokens)
+        cls = bert_out.last_hidden_state[:, 0, :]  # (B, 768), frozen, shared
 
-        for name, perceiver_module in perceivers.items():
-            pooled = _apply_perceiver(perceiver_module, patch_tokens)
-            image_embeds[name].append(F.normalize(pooled, dim=-1).cpu())
+        for name, (perceiver_module, fc_module, adapter_module) in triples.items():
+            image_embeds = _apply_image_side(perceiver_module, fc_module, patch_tokens)  # (B, 32, 4096)
+            text_embeds = adapter_module(cls)  # (B, 4096)
+            per_ckpt[name]["image"].append(image_embeds.cpu())
+            per_ckpt[name]["text"].append(text_embeds.cpu())
 
         n += volume.size(0)
         if n >= max_items:
             break
-    text_embeds = torch.cat(text_embeds, dim=0)
-    image_embeds = {name: torch.cat(embeds, dim=0) for name, embeds in image_embeds.items()}
-    return text_embeds, image_embeds
+
+    return {
+        name: (torch.cat(d["image"], dim=0), torch.cat(d["text"], dim=0))
+        for name, d in per_ckpt.items()
+    }
 
 
 def retrieval_accuracy(image_embeds, text_embeds):
-    """Standard i2t/t2i top-1/top-5 retrieval accuracy. Index i's image and index i's
-    text are the one true positive pair (every other index is a negative), matching
-    how PerOrganDataset emits one item per (patient, organ)."""
-    sim = image_embeds @ text_embeds.t()  # (N, N)
+    """Standard i2t/t2i top-1/top-5 retrieval accuracy, using the same similarity
+    losses.info_nce_loss trains against: average of each image's 32 per-token
+    cosine similarities to a given text, not a single pooled-vector cosine.
+    image_embeds: (N, 32, 4096). text_embeds: (N, 4096)."""
+    image_embeds = F.normalize(image_embeds, dim=-1)
+    text_embeds = F.normalize(text_embeds, dim=-1)
+    sim_per_token = torch.einsum("ikd,jd->ijk", image_embeds, text_embeds)  # (N, N, 32)
+    sim = sim_per_token.mean(dim=-1)  # (N, N)
     n = sim.size(0)
     targets = torch.arange(n)
 
@@ -105,8 +117,9 @@ def retrieval_accuracy(image_embeds, text_embeds):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoints", nargs="+", required=True,
-                         help="e.g. step10000 step20000 - matches "
-                              "perceiver-<name>.pth in the checkpoint dir")
+                         help="e.g. step10000 step30000 - matches "
+                              "perceiver-<name>.pth/fc-<name>.pth/adapter-<name>.pth "
+                              "in the checkpoint dir")
     parser.add_argument("--max_items", type=int, default=400,
                          help="number of held-out (patient, organ) items to evaluate on")
     parser.add_argument("--cuda_device", default="3")
@@ -128,20 +141,15 @@ def main():
     print("Building model (vision_encoder + BERT text_encoder, shared across all checkpoints)...")
     model = PerceiverAlignmentModel(device)
 
-    print(f"Loading {len(args.checkpoints)} perceiver checkpoints...")
-    perceivers = {}
-    for ckpt_name in args.checkpoints:
-        ckpt_path = os.path.join(CKPT_DIR, f"perceiver-{ckpt_name}.pth")
-        perceivers[ckpt_name] = _load_perceiver(ckpt_path, device)
+    print(f"Loading {len(args.checkpoints)} (perceiver, fc, adapter) checkpoint triples...")
+    triples = {name: _load_triple(name, device) for name in args.checkpoints}
 
     print("Running single pass over held-out data (CT loading + ViT + BERT done once, "
-          "perceiver applied per checkpoint)...")
-    text_embeds, image_embeds_by_ckpt = compute_embeddings(
-        model, perceivers, loader, device, args.max_items
-    )
+          "perceiver+fc+adapter applied per checkpoint)...")
+    embeds_by_ckpt = compute_embeddings(model, triples, loader, device, args.max_items)
 
     results = {}
-    for ckpt_name, image_embeds in image_embeds_by_ckpt.items():
+    for ckpt_name, (image_embeds, text_embeds) in embeds_by_ckpt.items():
         metrics = retrieval_accuracy(image_embeds, text_embeds)
         results[ckpt_name] = metrics
         print(f"\n{ckpt_name} (n={image_embeds.size(0)}):")

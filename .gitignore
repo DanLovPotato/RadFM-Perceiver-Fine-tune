@@ -5,3 +5,4 @@ scripts/wandb/
 *.log
 sample_cache/
 .DS_Store
+*.log.*
