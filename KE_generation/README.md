@@ -19,7 +19,7 @@ Reg2RG 在写某个病人某个器官的报告时，会参考 **5 份相似的 t
 
 ## 怎么跑
 
-**1. 改设置。** 打开 `run_train.sh` 和 `run_test.sh`，改最上面几行（两个脚本要写一样的）：
+**1. 改设置。** 打开 `run_train.sh` 和 `run_test.sh`，改最上面几行。`ckpt_name`、`ckpt_dir`、`out_dir` 两个脚本必须写一样的；GPU 可以不同（默认 train 用 1 号、test 用 2 号）：
 
 ```bash
 cuda_device="1"          # 用哪张 GPU
@@ -45,7 +45,7 @@ test 要用 train 第 [3] 步算出的图像均值 (M)，所以必须等 train *
 
 | 脚本 | 大约多久 |
 |---|---|
-| `run_train.sh` | 约 7 小时（几乎都花在 [3] 编码 24126 个病人的 CT 上） |
+| `run_train.sh` | 约 5 小时（几乎都花在 [3] 编码 24126 个病人的 CT 上；[0]–[2] 只要几分钟） |
 | `run_test.sh` | 约 30 分钟 |
 
 ## 跑完得到什么
@@ -75,7 +75,9 @@ Reg2RG 配置这样填：
 | 训练 | `organ_report_embeddings.npz` | `train/organ_annotation.json` |
 | 验证 | `organ_report_embeddings.npz`（**同一个**） | `val/organ_annotation.json` |
 
-npz 和 json 的格式、维度和以前完全一样，Reg2RG 不用改。
+npz 和 json 的格式和以前完全一样，只是文本向量从 256 维变成 4096 维。Reg2RG 的读取代码不用改（RWLKE 会按 npz 自动设成 4096 维），但**模型要从头训练**。
+
+**Reg2RG 的器官分支要用同一个 checkpoint 的 perceiver + fc。** bank 是按"ViT → perceiver → fc"这条路径检索出来的，Reg2RG 里器官裁剪图最好也走同一条路径。已经改好的版本在 `Reg2RG-debug-current-full_correct_F_20260920_1027`：器官分支单独用 `perceiver-<ckpt_name>.pth`（冻结）和 `fc-<ckpt_name>.pth`（继续训练），配置文件是 `configs/train_radgenome/perceiver_step145000.sh` 和 `configs/test_radgenome/perceiver_step145000.sh`。
 
 ## 流程图
 
@@ -105,21 +107,16 @@ npz 和 json 的格式、维度和以前完全一样，Reg2RG 不用改。
 ┃     输出：(A) organ_report_embeddings_unique_4096.npz
         │
         ▼
-┃ [1b] 原型（新）
-┃     输入：(A) + (L)
-┃     做法：每个器官，正常句子的平均向量 → 正常原型 Pn
-┃                     异常句子的平均向量 → 异常原型 Pa
-┃           （只用真实写出来的句子，不用模板句）
-┃     输出：(P) prototypes.npz
-        │
-        ▼
 ┃ [2] build_dense_bank.py —— 展开成每个病人一条（不变）
 ┃     输入：(U) + (A)
 ┃     输出：(B) ★ organ_report_embeddings.npz（24126 × 10 × 4096）
         │
         ▼
 ┃ [3] build_organ_annotation.py --split train —— 挑参考报告（改）
-┃     输入：(A) (L) (P) + train 的 CT 和器官 mask
+┃     输入：(A) (L) + train 的 CT 和器官 mask
+┃     [1b] 先做原型（新）：每个器官，正常句子的平均向量 → 正常原型 Pn
+┃                               异常句子的平均向量 → 异常原型 Pa
+┃          （只用真实写出来的句子，不用模板句）→ (P) prototypes.npz
 ┃     a) CT 按 mask 裁剪 → ViT → perceiver → fc → 图像向量 q
 ┃     b) 零样本判断（不设阈值）：q 离 Pn 更近 → 正常；离 Pa 更近 → 异常
 ┃     c) 正常 → 只在正常句子里挑最近的 5 句
@@ -127,7 +124,9 @@ npz 和 json 的格式、维度和以前完全一样，Reg2RG 不用改。
 ┃        esophagus、trachea、breast、thyroid 不做判断 → 在所有句子里挑最近的 5 句
 ┃     d) 跳过同一个人所有扫描写过的句子
 ┃     输出：★ train/organ_annotation.json
+┃           (P) prototypes.npz
 ┃           (M) train/image_mean.npz（train 图像均值，异常池去均值用）
+┃           train/decisions.npz（零样本判断，检查用）、train/image_queries.pt（缓存）
 ```
 
 | 步骤 | 做什么 |
@@ -135,8 +134,8 @@ npz 和 json 的格式、维度和以前完全一样，Reg2RG 不用改。
 | [0] | 把 train 报告按器官去重，记下每句话是哪些病人写的。 |
 | **[0b]（新）** | 给每句话标上正常/异常，方法见下面"正常/异常怎么定义"。 |
 | [1] | 每句话通过 BERT 和 `adapter` 变成 4096 维向量。 |
-| **[1b]（新）** | 每个器官做两个原型：正常句子的平均向量 Pn、异常句子的平均向量 Pa。只用真实写出来的句子，不用模板句；不按写过这句话的人数加权（去掉模板句后，加不加权结果几乎一样，balanced acc 0.73 vs 0.74）。 |
 | [2] | 展开成 Reg2RG 读取的 bank（不变）。 |
+| **[1b]（新，在 [3] 开头执行）** | 每个器官做两个原型：正常句子的平均向量 Pn、异常句子的平均向量 Pa。只用真实写出来的句子，不用模板句；不按写过这句话的人数加权（去掉模板句后，加不加权结果几乎一样，balanced acc 0.73 vs 0.74）。 |
 | **[3]（改）** | a) CT 按器官 mask 裁剪，经过 ViT → `perceiver` → `fc` 得到图像向量 q。b) **零样本判断，不设阈值：** q 离正常原型更近就判为正常，否则判为异常。c) 判为正常的只在正常句子里挑最近的 5 句；判为异常的只在异常句子里挑，并且图像和文本都先去均值。esophagus、trachea、breast、thyroid 不做判断，直接在所有句子里挑。d) 跳过同一个人所有扫描写过的句子。另外存下 train 图像均值 (M)。 |
 
 ### Test（`run_test.sh`）
@@ -156,6 +155,7 @@ npz 和 json 的格式、维度和以前完全一样，Reg2RG 不用改。
 ┃        esophagus、trachea、breast、thyroid 不做判断 → 在所有句子里挑
 ┃     d) 不用排除同一个人（val 病人本来就不在 bank 里）
 ┃     输出：★ val/organ_annotation.json
+┃           val/decisions.npz（检查用）、val/image_queries.pt（缓存）
 ```
 
 | 步骤 | 做什么 |
@@ -165,16 +165,18 @@ npz 和 json 的格式、维度和以前完全一样，Reg2RG 不用改。
 
 ## 为什么要两阶段
 
-旧的一阶段做法是在一个器官的所有句子里直接挑最近的 5 句。测试发现**正常的病人大多被配上了异常的报告**：100 个 val 病人里，正常病人拿到的邻居只有约 20% 是正常的。
+旧的一阶段做法是在一个器官的所有句子里直接挑最近的 5 句。测试发现**正常的病人大多被配上了异常的报告**：全部 val 病人里，正常病人拿到的参考报告平均只有 25% 是正常的（abdomen 0%、lung 3%，见下面"两阶段的测试结果"）。
 
 原因是**去重之后，异常句子的行数远多于正常句子**。正常的写法很集中（几千人共用几句话），异常的写法几乎每人一句：
 
-| 器官 | 正常的病人 | bank 里正常句子 | 异常句子 | 异常 : 正常 |
+| 器官 | 正常的 train 病人 | bank 里正常句子 | 异常句子 | 异常 : 正常 |
 |---|---|---|---|---|
-| breast | 97% | 197 | 634 | 3.2 倍 |
-| bone | 65% | 1039 | 5504 | 5.3 倍 |
+| breast | 97%（大多是模板句） | 203 | 628 | 3.1 倍 |
+| bone | 66% | 1041 | 5502 | 5.3 倍 |
 | pleura | 72% | 836 | 6417 | 7.7 倍 |
-| lung | 18% | 809 | 19146 | 23.7 倍 |
+| lung | 18% | 824 | 19131 | 23.2 倍 |
+
+（数字来自 `label_bank.py` 的输出，正常句子包含模板句那一行。）
 
 即使一个正常病人"平均来说"离正常句子更近，从几千个异常句子里也总有几个恰好离他更近，挑最近的 5 句就会被数量压倒。所以先判断正常/异常，再只在同一类句子里挑。
 
@@ -196,7 +198,7 @@ npz 和 json 的格式、维度和以前完全一样，Reg2RG 不用改。
 
 - 训练时只用了报告里写了句子的器官，模板句从没出现过，所以它离所有图像都远；
 - 如果用它做原型，breast、thyroid 的正常原型几乎就是这一句（99% 的人用它），所有人都会被判成异常；
-- Reg2RG 也只为报告里写了句子的器官查参考报告，模板句对应的器官根本不会被查询。
+- Reg2RG 训练时只用报告里写了句子的器官；测试时没写句子的器官也会查参考报告并生成文字，但它们的 GT 为空，逐区域评估会跳过，只影响整篇报告的指标（见下面"两阶段的测试结果" B）。
 
 **这 4 个器官不做判断，直接在所有句子里挑：**
 
@@ -282,7 +284,7 @@ scan id 的格式是 `train_10006_b_1`：`10006` 是**人**，`b` 是这个人�
 - **已经生成过的中间文件会自动跳过。** 想重新生成，就删掉对应的文件。
 - **[3] 慢在哪里？** 慢在 CPU 读 CT、按 mask 裁剪器官，不在 GPU，所以多加 GPU 不会变快。要提速就调大脚本里的 `num_workers`（默认 16；每个约占 3–4GB 内存，机器是共享的，别开太大）。每个病人的 CT 只读一次、一次裁出所有器官，调用的是 Reg2RG 自己的 `mask_nii_img_to_tensor`，和 Reg2RG 的预处理完全一样（逐像素核对过）。
 - **[3] 中断了可以接着跑吗？** 不能续跑，要从头开始。但如果图像已经编码完（`image_queries.pt` 已经存在），重跑只要几分钟。
-- **bank 大约 4GB。** Reg2RG 会在每张 GPU 上放一份。显存不够的话，把脚本里的 `bank_dtype` 改成 `"float16"`，约 2GB。
+- **bank 大约 4GB。** Reg2RG 会在每张 GPU 上放一份。`run_train.sh` 里的 `bank_dtype` 改成 `"float16"` 只能把**文件**减到约 2GB：Reg2RG 读取时会转回 float32（`my_embedding_layer.py` 里的 `.float()`），显存不会变少。改了要删掉旧的 `organ_report_embeddings.npz` 才会重新生成。
 - **thyroid、breast 的数据很少。** 胸部 CT 报告一般只在甲状腺/乳腺有异常时才顺带写一句，train 只有约 4.5% 的扫描写了 thyroid（val 51 人），其余都是模板句。thyroid 的正常/异常标签也不可靠：vqa 表里 thyroid 只有 856 行，没有 vqa 行的病人默认算正常，所以 "Both lobes of the thyroid gland are slightly prominent and heterogeneous" 这样的句子也会被标成正常。
 - **Reg2RG 的 KE 模块要用这个 4096 维 bank 重新训练**，用其他维度 bank 训出来的权重加载不了。
 
